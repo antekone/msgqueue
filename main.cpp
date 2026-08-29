@@ -2,6 +2,7 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "msgqueue/queue.h"
@@ -129,6 +130,53 @@ TEST(msgqueue, threadedBlockingSendUnblocksAfterReceive) {
     auto second = chan->receiver.blockingRecv();
     ASSERT_TRUE(second.has_value());
     EXPECT_EQ(*second, "second");
+}
+
+TEST(msgqueue, threadedBlockingSendWithClonedSenders) {
+    auto chan = msgqueue::create<std::string>(1);
+    ASSERT_TRUE(chan.has_value());
+    ASSERT_EQ(chan->sender.trySend("first"), msgqueue::Error::Ok);
+
+    auto firstSender = chan->sender;
+    auto secondSender = chan->sender;
+    std::promise<msgqueue::Error> firstResult;
+    std::promise<msgqueue::Error> secondResult;
+    auto firstFuture = firstResult.get_future();
+    auto secondFuture = secondResult.get_future();
+
+    std::thread firstThread([&] {
+        firstResult.set_value(firstSender.blockingSend(std::string("from first sender")));
+    });
+    std::thread secondThread([&] {
+        secondResult.set_value(secondSender.blockingSend(std::string("from second sender")));
+    });
+
+    EXPECT_EQ(firstFuture.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    EXPECT_EQ(secondFuture.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+
+    auto first = chan->receiver.blockingRecv();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, "first");
+
+    while (firstFuture.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready &&
+           secondFuture.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+    }
+
+    auto second = chan->receiver.blockingRecv();
+    ASSERT_TRUE(second.has_value());
+
+    EXPECT_EQ(firstFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(secondFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(firstFuture.get(), msgqueue::Error::Ok);
+    EXPECT_EQ(secondFuture.get(), msgqueue::Error::Ok);
+    firstThread.join();
+    secondThread.join();
+
+    auto third = chan->receiver.blockingRecv();
+    ASSERT_TRUE(third.has_value());
+    EXPECT_NE(*second, *third);
+    EXPECT_TRUE((*second == "from first sender" && *third == "from second sender") ||
+                (*second == "from second sender" && *third == "from first sender"));
 }
 
 TEST(msgqueue, threadedBlockingRecv) {
