@@ -28,6 +28,7 @@ template <typename A> class Receiver;
 template <typename A> class Sender;
 template <typename A> class Channel;
 template <typename A> class StateMonitor;
+template <typename A> class SenderLifetime;
 
 namespace internal {
 
@@ -37,6 +38,7 @@ public:
     friend class Receiver<A>;
     friend class Sender<A>;
     friend class StateMonitor<A>;
+    friend class SenderLifetime<A>;
 
     State(size_t c) : capacity(c) { }
 
@@ -44,18 +46,11 @@ public:
     State& operator= (State&&) = delete;
 
 private:
-    // TODO: in Receiver dtor, decrease this
-    int senders = 0;
-    // TODO: in Receiver ctor, set this to true, panic if it's already true
     bool receiverAlive = false;
-
     size_t capacity = 0;
-
     std::mutex lock;
     std::deque<A> messages;
-
     std::condition_variable notFull;
-
     // blockingRead should be woken up
     std::condition_variable receiveRead;
 };
@@ -65,13 +60,29 @@ private:
 template <typename A>
 class StateMonitor {
 public:
-    StateMonitor(const std::shared_ptr<internal::State<A>>& s) : stateRef(s) {}
+    StateMonitor(
+        const std::weak_ptr<SenderLifetime<A>>& l,
+        const std::weak_ptr<internal::State<A>>& stateRef
+    ) : weakLifetime(l), weakState(stateRef) {}
 
-    int getSenderCount() const { return stateRef->senders; }
-    bool hasReceiver() const { return stateRef->receiverAlive; }
+    int getSenderCount() const { 
+        return weakLifetime.use_count();
+    }
+
+    bool hasReceiver() const { 
+        auto p = weakState.lock();
+        if (p) {
+            return p->receiverAlive; 
+        } else {
+            // if State doesn't exist, this means there are no Senders nor
+            // Receivers left.
+            return false;
+        }
+    }
 
 private:
-    std::shared_ptr<internal::State<A>> stateRef;
+    std::weak_ptr<SenderLifetime<A>> weakLifetime;
+    std::weak_ptr<internal::State<A>> weakState;
 };
 
 // --------------------------------------------------------------------
@@ -82,7 +93,10 @@ class Receiver {
 public:
     friend class Channel<A>;
 
-    explicit Receiver(std::shared_ptr<internal::State<A>>&& s) : stateRef(std::move(s)) {
+    explicit Receiver(
+        std::shared_ptr<internal::State<A>>&& s,
+        std::weak_ptr<SenderLifetime<A>>& lifetime
+    ) : stateRef(std::move(s)), weakSenderLifetime(lifetime) {
         if (stateRef->receiverAlive) {
             // This shouldn't be possible, unless msgqueue has bad implementation.
             throw BadState {};
@@ -92,10 +106,16 @@ public:
         stateRef->receiverAlive = true;
     }
 
+    ~Receiver() {
+        if (stateRef) {
+            std::unique_lock m(stateRef->lock);
+            stateRef->receiverAlive = false;
+            stateRef->notFull.notify_all();
+        }
+    }
+
     Receiver(Receiver&& src) = default;
     Receiver& operator= (Receiver&& src) = default; 
-
-    StateMonitor<A> createMonitor() { return StateMonitor { stateRef }; }
 
     std::optional<std::expected<A, Error>> tryRecv() {
         if (!stateRef)
@@ -106,6 +126,7 @@ public:
         if (!stateRef->messages.empty()) {
             auto&& msg = std::move(stateRef->messages.front());
             stateRef->messages.pop_front();
+            stateRef->notFull.notify_all();
             return msg;
         }
 
@@ -114,7 +135,7 @@ public:
         // message on this queue again, so we flag it as Disconnected, so
         // parent can quit.
         
-        if (stateRef->senders == 0)
+        if (weakSenderLifetime.expired())
             return std::unexpected { Error::Disconnected };
 
         // We have senders, but queue is empty.
@@ -129,13 +150,14 @@ public:
 
         stateRef->receiveRead.wait(m, [&] () {
             bool hasMessages = !stateRef->messages.empty();
-            bool hasSenders = stateRef->senders > 0;
+            bool hasSenders = !weakSenderLifetime.expired();
             return hasMessages || !hasSenders;
         });
 
         if (!stateRef->messages.empty()) {
             A msg = std::move(stateRef->messages.front());
             stateRef->messages.pop_front();
+            stateRef->notFull.notify_all();
             return msg;
         }
 
@@ -144,7 +166,7 @@ public:
         // message on this queue again, so we flag it as Disconnected, so
         // parent can quit.
         
-        if (stateRef->senders == 0)
+        if (weakSenderLifetime.expired())
             return std::unexpected { Error::Disconnected };
 
         return std::unexpected { Error::Internal };
@@ -155,9 +177,28 @@ private:
     Receiver& operator= (const Receiver&) = delete;
 
     std::shared_ptr<internal::State<A>> stateRef;
+    std::weak_ptr<SenderLifetime<A>> weakSenderLifetime;
 };
 
 // --------------------------------------------------------------------
+
+template <typename A>
+class SenderLifetime {
+public:
+    friend class Sender<A>;
+    friend class StateMonitor<A>;
+
+    SenderLifetime(std::shared_ptr<internal::State<A>> s) : stateRef(s) { }
+    ~SenderLifetime() {
+        if (stateRef) {
+            std::unique_lock _(stateRef->lock);
+            stateRef->receiveRead.notify_all();
+        }
+    }
+
+private:
+    std::shared_ptr<internal::State<A>> stateRef;
+};
 
 // Senders can be cloned.
 template <typename A>
@@ -165,114 +206,86 @@ class Sender {
 public:
     friend class Channel<A>;
 
-    explicit Sender(std::shared_ptr<internal::State<A>> s) : stateRef(s) {
-        if (stateRef) {
-            std::unique_lock m(stateRef->lock);
-            stateRef->senders++;
-        }
+    explicit Sender(std::shared_ptr<SenderLifetime<A>> s) : lifetime(s) {
     }
 
-    Sender(const Sender<A>& s) : stateRef(s.stateRef) {
-        if (stateRef) {
-            std::unique_lock m(stateRef->lock);
-            stateRef->senders++;
-        }
+    StateMonitor<A> createMonitor() { 
+        return StateMonitor { 
+            std::weak_ptr<SenderLifetime<A>>(lifetime) ,
+            std::weak_ptr<internal::State<A>>(lifetime->stateRef),
+        }; 
     }
-
-    Sender(Sender<A>&& s) : stateRef(std::move(s.stateRef)) {
-    }
-
-    Sender<A>& operator= (const Sender<A>& s) {
-        if (this == &s) 
-            return *this;
-
-        if (stateRef) {
-            std::unique_lock m1(stateRef->lock);
-            stateRef->senders--;
-            notifyIfNeeded();
-            m1.unlock();
-        }
-
-        stateRef = s.stateRef;
-
-        if (stateRef) {
-            std::unique_lock m(stateRef->lock);
-            stateRef->senders++;
-        }
-
-        return *this;
-    }
-
-    Sender<A>& operator= (Sender<A>&& s) {
-        if (this == &s) 
-            return *this;
-
-        if (stateRef) {
-            std::unique_lock m1(stateRef->lock);
-            stateRef->senders--;
-            notifyIfNeeded();
-            m1.unlock();
-        }
-
-        stateRef = std::move(s.stateRef);
-        return *this;
-    }
-
-    ~Sender() {
-        if (stateRef) {
-            std::unique_lock m(stateRef->lock);
-            stateRef->senders--;
-            notifyIfNeeded();
-        }
-    }
-
-    StateMonitor<A> createMonitor() { return StateMonitor { stateRef }; }
 
     Error trySend(const A& message) {
-        if (!stateRef)
+        if (!lifetime || !lifetime->stateRef)
             return Error::BadState;
 
-        std::unique_lock m(stateRef->lock);
+        std::unique_lock m(lifetime->stateRef->lock);
         return performSend(message);
     }
 
     Error trySend(A&& message) {
-        if (!stateRef)
+        if (!lifetime || !lifetime->stateRef)
             return Error::BadState;
 
-        std::unique_lock m(stateRef->lock);
+        std::unique_lock m(lifetime->stateRef->lock);
         return performSend(std::move(message));
     }
 
     Error blockingSend(const A& message) {
-        // TODO
-        return Error::Internal;
+        if (!lifetime || !lifetime->stateRef)
+            return Error::BadState;
+
+        std::unique_lock m(lifetime->stateRef->lock);
+        return performBlockingSend(m, message);
     }
 
     Error blockingSend(A&& message) {
-        // TODO
-        return Error::Internal;
+        if (!lifetime || !lifetime->stateRef)
+            return Error::BadState;
+
+        std::unique_lock m(lifetime->stateRef->lock);
+        return performBlockingSend(m, std::move(message));
     }
 
 private:
-    Error performSend(A&& message) {
-        if (stateRef->messages.size() >= stateRef->capacity) {
+    Error sanityCheck() {
+        if (!lifetime->stateRef->receiverAlive)
+            return Error::Disconnected;
+
+        if (lifetime->stateRef->messages.size() >= lifetime->stateRef->capacity) {
             return Error::Full;
         }
 
-        stateRef->messages.emplace_back(std::move(message));
         return Error::Ok;
     }
 
-    void notifyIfNeeded() {
-        if (stateRef) {
-            if (stateRef->senders == 0) {
-                stateRef->receiveRead.notify_all();
-            }
-        }
+    Error performSend(A&& message) {
+        auto err = sanityCheck();
+        if (err != Error::Ok)
+            return err;
+
+        lifetime->stateRef->messages.emplace_back(std::move(message));
+        lifetime->stateRef->receiveRead.notify_all();
+        return Error::Ok;
     }
 
-    std::shared_ptr<internal::State<A>> stateRef;
+    Error performBlockingSend(std::unique_lock<std::mutex>& lock, A&& message) {
+        auto err = sanityCheck();
+        if (err == Error::Full) {
+            lifetime->stateRef->notFull.wait(lock, [&] {
+                auto notFull = lifetime->stateRef->messages.size() < lifetime->stateRef->capacity;
+                auto hasReceivers = lifetime->stateRef->receiverAlive;
+                return notFull || !hasReceivers;
+            });
+        } else if (err != Error::Ok) {
+            return err;
+        }
+
+        return performSend(std::move(message));
+    }
+
+    std::shared_ptr<SenderLifetime<A>> lifetime;
 };
 
 // --------------------------------------------------------------------
@@ -282,6 +295,14 @@ class Channel {
 public:
     Sender<A> sender;
     Receiver<A> receiver;
+
+    void destroySender() {
+        auto _ = std::move(sender);
+    }
+
+    void destroyListener() {
+        auto _ = std::move(receiver);
+    }
 };
 
 // --------------------------------------------------------------------
@@ -293,9 +314,12 @@ std::expected<Channel<A>, Error> create(size_t capacity) {
     }
 
     auto state = std::make_shared<internal::State<A>>(capacity);
+    auto lifetime = std::make_shared<SenderLifetime<A>>(state);
+    std::weak_ptr<SenderLifetime<A>> weakLifetime = lifetime;
+
     return Channel<A> {
-        Sender { state },
-        Receiver { std::move(state) }
+        Sender<A> { lifetime },
+        Receiver<A> { std::move(state), weakLifetime }
     };
 }
 
