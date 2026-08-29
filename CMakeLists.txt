@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 4.0)
+project(msgqueue_test)
+add_executable(msgqueue_test main.cpp)
+target_compile_options(msgqueue_test PUBLIC -Wall)
+target_compile_features(msgqueue_test PUBLIC cxx_std_23)
