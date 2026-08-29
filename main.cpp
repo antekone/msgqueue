@@ -206,3 +206,37 @@ TEST(msgqueue, threadedBlockingRecv) {
         ASSERT_EQ(result, shouldBe);
     }
 }
+
+TEST(msgqueue, variantTest) {
+    enum class Mode { One, Two, Three };
+    auto chan = msgqueue::create<std::variant<Mode>>(10);
+    chan->sender.blockingSend(Mode::One);
+    chan->sender.blockingSend(Mode::Two);
+    chan->sender.blockingSend(Mode::Three);
+    auto one = chan->receiver.blockingRecv();
+    auto two = chan->receiver.blockingRecv();
+    auto three = chan->receiver.blockingRecv();
+    ASSERT_EQ(one, Mode::One);
+    ASSERT_EQ(two, Mode::Two);
+    ASSERT_EQ(three, Mode::Three);
+}
+
+TEST(msgqueue, objectTest) {
+    class Object {
+    public:
+        Object(const std::string& msg) { something = msg; }
+        std::string something;
+    };
+
+    auto chan = msgqueue::create<Object>(10);
+    chan->sender.blockingSend(Object("abc"));
+    chan->sender.blockingSend(std::move(Object("def")));
+    auto value = Object("ghi");
+    chan->sender.blockingSend(value);
+    auto one = chan->receiver.blockingRecv();
+    auto two = chan->receiver.blockingRecv();
+    auto three = chan->receiver.blockingRecv();
+    ASSERT_EQ(one->something, "abc");
+    ASSERT_EQ(two->something, "def");
+    ASSERT_EQ(three->something, "ghi");
+}

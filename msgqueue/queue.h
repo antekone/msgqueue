@@ -7,6 +7,7 @@
 #include <expected>
 #include <optional>
 #include <deque>
+#include <utility>
 
 namespace msgqueue {
 
@@ -260,17 +261,19 @@ private:
         return Error::Ok;
     }
 
-    Error performSend(A&& message) {
+    template <typename T>
+    Error performSend(T&& message) {
         auto err = sanityCheck();
         if (err != Error::Ok)
             return err;
 
-        lifetime->stateRef->messages.emplace_back(std::move(message));
+        lifetime->stateRef->messages.emplace_back(std::forward<T>(message));
         lifetime->stateRef->receiveRead.notify_all();
         return Error::Ok;
     }
 
-    Error performBlockingSend(std::unique_lock<std::mutex>& lock, A&& message) {
+    template <typename T>
+    Error performBlockingSend(std::unique_lock<std::mutex>& lock, T&& message) {
         auto err = sanityCheck();
         if (err == Error::Full) {
             lifetime->stateRef->notFull.wait(lock, [&] {
@@ -282,7 +285,7 @@ private:
             return err;
         }
 
-        return performSend(std::move(message));
+        return performSend(std::forward<T>(message));
     }
 
     std::shared_ptr<SenderLifetime<A>> lifetime;
